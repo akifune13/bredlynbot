@@ -1,10 +1,12 @@
 import discord
 from discord.ext import commands
+from discord.ui import Button, View
 import requests
 from datetime import datetime
 from typing import Optional, Dict
 import os
 from dotenv import load_dotenv
+import json
 
 # Load environment variables from .env file
 load_dotenv()
@@ -67,7 +69,7 @@ class OsuAPI:
         }
         return self._make_request(f"users/{user_id}/scores/recent", params) or []
     
-    def get_user_best(self, user_id: int, mode: str = "osu", limit: int = 5) -> list:
+    def get_user_best(self, user_id: int, mode: str = "osu", limit: int = 100) -> list:
         """Get best scores for a user."""
         params = {
             'mode': mode,
@@ -76,13 +78,155 @@ class OsuAPI:
         return self._make_request(f"users/{user_id}/scores/best", params) or []
 
 
+class UserLinkManager:
+    """Manager for storing Discord user to osu! account links."""
+    
+    def __init__(self, filename: str = "user_links.json"):
+        self.filename = filename
+        self.links = self._load_links()
+    
+    def _load_links(self) -> dict:
+        """Load user links from file."""
+        try:
+            if os.path.exists(self.filename):
+                with open(self.filename, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            print(f"Error loading user links: {e}")
+        return {}
+    
+    def _save_links(self):
+        """Save user links to file."""
+        try:
+            with open(self.filename, 'w') as f:
+                json.dump(self.links, f, indent=2)
+        except Exception as e:
+            print(f"Error saving user links: {e}")
+    
+    def link_user(self, discord_id: int, osu_username: str, mode: str = "osu"):
+        """Link a Discord user to an osu! account."""
+        self.links[str(discord_id)] = {
+            "osu_username": osu_username,
+            "mode": mode
+        }
+        self._save_links()
+    
+    def unlink_user(self, discord_id: int):
+        """Unlink a Discord user from their osu! account."""
+        discord_id_str = str(discord_id)
+        if discord_id_str in self.links:
+            del self.links[discord_id_str]
+            self._save_links()
+            return True
+        return False
+    
+    def get_linked_user(self, discord_id: int) -> Optional[Dict]:
+        """Get the linked osu! account for a Discord user."""
+        return self.links.get(str(discord_id))
+
+
+class TopPlaysPaginator(View):
+    """Paginated view for top plays."""
+    
+    def __init__(self, scores: list, user: dict, mode: str, per_page: int = 10):
+        super().__init__(timeout=300)  # 5 minute timeout
+        self.scores = scores
+        self.user = user
+        self.mode = mode
+        self.per_page = per_page
+        self.current_page = 0
+        self.max_pages = (len(scores) - 1) // per_page
+        
+        # Update button states
+        self.update_buttons()
+    
+    def update_buttons(self):
+        """Update button states based on current page."""
+        self.first_button.disabled = self.current_page == 0
+        self.prev_button.disabled = self.current_page == 0
+        self.next_button.disabled = self.current_page >= self.max_pages
+        self.last_button.disabled = self.current_page >= self.max_pages
+    
+    def get_embed(self) -> discord.Embed:
+        """Generate embed for current page."""
+        start_idx = self.current_page * self.per_page
+        end_idx = min(start_idx + self.per_page, len(self.scores))
+        page_scores = self.scores[start_idx:end_idx]
+        
+        embed = discord.Embed(
+            title=f"🏆 Top Plays for {self.user['username']}",
+            url=f"https://osu.ppy.sh/users/{self.user['id']}",
+            color=discord.Color.gold()
+        )
+        
+        embed.set_thumbnail(url=self.user['avatar_url'])
+        
+        for i, score in enumerate(page_scores, start_idx + 1):
+            beatmap = score['beatmap']
+            beatmapset = score['beatmapset']
+            
+            mods = f"+{','.join(score.get('mods', []))}" if score.get('mods') else "NoMod"
+            
+            value = (f"[{beatmap['version']}](https://osu.ppy.sh/b/{beatmap['id']}) "
+                    f"({beatmap['difficulty_rating']:.2f}★)\n"
+                    f"**{score.get('pp', 0):.0f}pp** • {score['accuracy'] * 100:.2f}% • "
+                    f"{score['rank']} • {score['max_combo']}x • {mods}")
+            
+            embed.add_field(
+                name=f"{i}. {beatmapset['artist']} - {beatmapset['title']}",
+                value=value,
+                inline=False
+            )
+        
+        embed.set_footer(
+            text=f"Page {self.current_page + 1}/{self.max_pages + 1} | "
+                 f"Mode: {self.mode} | Total PP: {self.user['statistics']['pp']:,.0f}"
+        )
+        
+        return embed
+    
+    @discord.ui.button(label="⏮️", style=discord.ButtonStyle.gray)
+    async def first_button(self, interaction: discord.Interaction, button: Button):
+        """Go to first page."""
+        self.current_page = 0
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+    
+    @discord.ui.button(label="◀️", style=discord.ButtonStyle.primary)
+    async def prev_button(self, interaction: discord.Interaction, button: Button):
+        """Go to previous page."""
+        self.current_page = max(0, self.current_page - 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+    
+    @discord.ui.button(label="▶️", style=discord.ButtonStyle.primary)
+    async def next_button(self, interaction: discord.Interaction, button: Button):
+        """Go to next page."""
+        self.current_page = min(self.max_pages, self.current_page + 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+    
+    @discord.ui.button(label="⏭️", style=discord.ButtonStyle.gray)
+    async def last_button(self, interaction: discord.Interaction, button: Button):
+        """Go to last page."""
+        self.current_page = self.max_pages
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+    
+    @discord.ui.button(label="🗑️", style=discord.ButtonStyle.danger)
+    async def delete_button(self, interaction: discord.Interaction, button: Button):
+        """Delete the message."""
+        await interaction.message.delete()
+
+
 # Initialize bot with command prefix
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
-# Initialize osu! API
+# Initialize osu! API and user link manager
 osu_api = None
+user_links = None
 
 @bot.event
 async def on_ready():
@@ -90,13 +234,70 @@ async def on_ready():
     print(f'Bot ID: {bot.user.id}')
     print('------')
 
+@bot.command(name='link')
+async def link_account(ctx, osu_username: str, mode: str = "osu"):
+    """
+    Link your Discord account to your osu! profile.
+    Usage: !link <osu_username> [mode]
+    Example: !link peppy osu
+    """
+    # Verify the osu! account exists
+    user = osu_api.get_user(osu_username, mode)
+    
+    if not user:
+        await ctx.send(f"❌ Could not find osu! user **{osu_username}** in mode **{mode}**")
+        return
+    
+    # Link the account
+    user_links.link_user(ctx.author.id, user['username'], mode)
+    
+    embed = discord.Embed(
+        title="✅ Account Linked!",
+        description=f"Your Discord account has been linked to **{user['username']}** ({mode} mode)",
+        color=discord.Color.green()
+    )
+    embed.set_thumbnail(url=user['avatar_url'])
+    embed.add_field(
+        name="💡 Tip",
+        value="You can now use commands without typing your username!\n"
+              "Example: `!profile` or `!recent`",
+        inline=False
+    )
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='unlink')
+async def unlink_account(ctx):
+    """
+    Unlink your Discord account from your osu! profile.
+    Usage: !unlink
+    """
+    if user_links.unlink_user(ctx.author.id):
+        await ctx.send("✅ Your account has been unlinked!")
+    else:
+        await ctx.send("❌ You don't have a linked account!")
+
 @bot.command(name='profile', aliases=['osu', 'p'])
-async def profile(ctx, username: str, mode: str = "osu"):
+async def profile(ctx, username: str = None, mode: str = None):
     """
     Get osu! user profile.
-    Usage: !profile <username> [mode]
-    Modes: osu, taiko, fruits, mania
+    Usage: !profile [username] [mode]
+    If username is not provided, uses your linked account.
     """
+    # If no username provided, try to get linked account
+    if username is None:
+        linked = user_links.get_linked_user(ctx.author.id)
+        if linked:
+            username = linked['osu_username']
+            mode = mode or linked['mode']
+        else:
+            await ctx.send("❌ Please provide a username or link your account with `!link <username>`")
+            return
+    
+    # Default mode
+    if mode is None:
+        mode = "osu"
+    
     await ctx.send(f"🔍 Fetching profile for **{username}**...")
     
     user = osu_api.get_user(username, mode)
@@ -134,11 +335,26 @@ async def profile(ctx, username: str, mode: str = "osu"):
     await ctx.send(embed=embed)
 
 @bot.command(name='recent', aliases=['rs', 'r'])
-async def recent(ctx, username: str, mode: str = "osu", limit: int = 1):
+async def recent(ctx, username: str = None, mode: str = None, limit: int = 1):
     """
     Get recent osu! scores.
-    Usage: !recent <username> [mode] [limit]
+    Usage: !recent [username] [mode] [limit]
+    If username is not provided, uses your linked account.
     """
+    # If no username provided, try to get linked account
+    if username is None:
+        linked = user_links.get_linked_user(ctx.author.id)
+        if linked:
+            username = linked['osu_username']
+            mode = mode or linked['mode']
+        else:
+            await ctx.send("❌ Please provide a username or link your account with `!link <username>`")
+            return
+    
+    # Default mode
+    if mode is None:
+        mode = "osu"
+    
     if limit > 5:
         limit = 5
     
@@ -208,15 +424,32 @@ async def recent(ctx, username: str, mode: str = "osu", limit: int = 1):
         await ctx.send(embed=embed)
 
 @bot.command(name='top', aliases=['best', 'bp'])
-async def top(ctx, username: str, mode: str = "osu", limit: int = 5):
+async def top(ctx, username: str = None, mode: str = None, limit: int = 100):
     """
-    Get top osu! plays.
-    Usage: !top <username> [mode] [limit]
+    Get top osu! plays with pagination.
+    Usage: !top [username] [mode] [limit]
+    If username is not provided, uses your linked account.
+    Max limit: 100 plays
     """
-    if limit > 10:
-        limit = 10
+    # If no username provided, try to get linked account
+    if username is None:
+        linked = user_links.get_linked_user(ctx.author.id)
+        if linked:
+            username = linked['osu_username']
+            mode = mode or linked['mode']
+        else:
+            await ctx.send("❌ Please provide a username or link your account with `!link <username>`")
+            return
     
-    await ctx.send(f"🔍 Fetching top plays for **{username}**...")
+    # Default mode
+    if mode is None:
+        mode = "osu"
+    
+    # Cap limit at 100
+    if limit > 100:
+        limit = 100
+    
+    await ctx.send(f"🔍 Fetching top {limit} plays for **{username}**...")
     
     user = osu_api.get_user(username, mode)
     if not user:
@@ -229,37 +462,11 @@ async def top(ctx, username: str, mode: str = "osu", limit: int = 5):
         await ctx.send(f"❌ No top plays found for **{username}**")
         return
     
-    # Create single embed with all top plays
-    embed = discord.Embed(
-        title=f"🏆 Top {len(scores)} Plays for {user['username']}",
-        url=f"https://osu.ppy.sh/users/{user['id']}",
-        color=discord.Color.gold()
-    )
-    
-    embed.set_thumbnail(url=user['avatar_url'])
-    
-    for i, score in enumerate(scores, 1):
-        beatmap = score['beatmap']
-        beatmapset = score['beatmapset']
-        
-        mods = f"+{','.join(score.get('mods', []))}" if score.get('mods') else "NoMod"
-        
-        value = (f"[{beatmap['version']}]({f'https://osu.ppy.sh/b/{beatmap["id"]}'}) "
-                f"({beatmap['difficulty_rating']:.2f}★)\n"
-                f"**{score.get('pp', 0):.0f}pp** • {score['accuracy'] * 100:.2f}% • "
-                f"{score['rank']} • {score['max_combo']}x • {mods}")
-        
-        embed.add_field(
-            name=f"{i}. {beatmapset['artist']} - {beatmapset['title']}",
-            value=value,
-            inline=False
-        )
-    
-    embed.set_footer(text=f"Mode: {mode} | Total PP: {user['statistics']['pp']:,.0f}")
-    
-    await ctx.send(embed=embed)
+    # Create paginated view
+    view = TopPlaysPaginator(scores, user, mode, per_page=10)
+    await ctx.send(embed=view.get_embed(), view=view)
 
-@bot.command(name='help')
+@bot.command(name='osuhelp')
 async def help_command(ctx):
     """Show help message."""
     embed = discord.Embed(
@@ -269,23 +476,28 @@ async def help_command(ctx):
     )
     
     embed.add_field(
-        name="!profile <username> [mode]",
-        value="Get user profile (aliases: !osu, !p)",
+        name="🔗 Account Linking",
+        value="`!link <username> [mode]` - Link your osu! account\n"
+              "`!unlink` - Unlink your account",
         inline=False
     )
     embed.add_field(
-        name="!recent <username> [mode] [limit]",
-        value="Get recent scores (aliases: !rs, !r)",
+        name="📊 Stats Commands",
+        value="`!profile [username] [mode]` - Get user profile (aliases: !osu, !p)\n"
+              "`!recent [username] [mode] [limit]` - Get recent scores (aliases: !rs, !r)\n"
+              "`!top [username] [mode] [limit]` - Get top plays with pages (aliases: !best, !bp)",
         inline=False
     )
     embed.add_field(
-        name="!top <username> [mode] [limit]",
-        value="Get top plays (aliases: !best, !bp)",
-        inline=False
-    )
-    embed.add_field(
-        name="Modes",
+        name="🎯 Modes",
         value="osu, taiko, fruits, mania (default: osu)",
+        inline=False
+    )
+    embed.add_field(
+        name="💡 Tips",
+        value="• Link your account to use commands without typing your username!\n"
+              "• Use arrow buttons to navigate through pages in !top\n"
+              "• You can still check other players by providing their username",
         inline=False
     )
     
@@ -309,9 +521,12 @@ if __name__ == "__main__":
         print("  OSU_CLIENT_SECRET=your_secret")
         exit(1)
     
-    # Initialize osu! API
+    # Initialize osu! API and user link manager
     print("Initializing osu! API...")
     osu_api = OsuAPI(OSU_CLIENT_ID, OSU_CLIENT_SECRET)
+    
+    print("Initializing user link manager...")
+    user_links = UserLinkManager()
     
     # Start the bot
     print("Starting Discord bot...")
